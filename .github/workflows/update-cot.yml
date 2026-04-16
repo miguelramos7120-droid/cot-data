@@ -3,8 +3,9 @@ name: Update COT Data
 on:
   schedule:
     - cron: '0 21 * * 5'   # Sexta 21:00 UTC (22:00 Lisboa)
-    - cron: '0 10 * * 6'   # Sábado 10:00 UTC (backup se sexta falhou)
-  workflow_dispatch:        # Botão manual no GitHub
+    - cron: '0 22 * * 5'   # Sexta 22:00 UTC (retry 1h depois)
+    - cron: '0 10 * * 6'   # Sábado 10:00 UTC (backup)
+  workflow_dispatch:
 
 jobs:
   update-cot:
@@ -15,61 +16,62 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Download COT from CFTC (com retries)
+      - name: Download COT from CFTC
         run: |
           mkdir -p data
           SUCCESS=false
 
+          # A CFTC bloqueia curl. wget funciona.
           for ATTEMPT in 1 2 3; do
             echo "=== Tentativa $ATTEMPT de 3 ==="
 
-            HTTP_CODE=$(curl -sL --max-time 60 \
-              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              -o data/deafut_new.txt \
-              -w "%{http_code}" \
-              "https://www.cftc.gov/dea/newcot/deafut.txt" 2>&1)
+            wget -q \
+              --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --header="Accept: text/plain,*/*" \
+              --header="Accept-Language: en-US,en;q=0.9" \
+              --tries=2 \
+              --timeout=30 \
+              -O data/deafut_new.txt \
+              "https://www.cftc.gov/dea/newcot/deafut.txt"
+            
+            WGET_EXIT=$?
+            SIZE=$(wc -c < data/deafut_new.txt 2>/dev/null || echo 0)
+            echo "wget exit: $WGET_EXIT, tamanho: $SIZE bytes"
 
-            echo "HTTP: $HTTP_CODE"
-
-            if [ "$HTTP_CODE" = "200" ]; then
+            if [ "$WGET_EXIT" = "0" ] && [ "$SIZE" -gt 10000 ]; then
               LINES=$(wc -l < data/deafut_new.txt)
               echo "Linhas: $LINES"
+              
+              NEW_DATE=$(head -1 data/deafut_new.txt | grep -oP '\d{4}-\d{2}-\d{2}' | head -1)
+              echo "Data COT novo: $NEW_DATE"
 
-              if [ "$LINES" -gt 50 ]; then
-                NEW_DATE=$(head -1 data/deafut_new.txt | grep -oP '\d{4}-\d{2}-\d{2}' | head -1)
-                echo "Data COT novo: $NEW_DATE"
+              OLD_DATE=""
+              if [ -f data/deafut.txt ]; then
+                OLD_DATE=$(head -1 data/deafut.txt | grep -oP '\d{4}-\d{2}-\d{2}' | head -1)
+                echo "Data COT anterior: $OLD_DATE"
+              fi
 
-                OLD_DATE=""
-                if [ -f data/deafut.txt ]; then
-                  OLD_DATE=$(head -1 data/deafut.txt | grep -oP '\d{4}-\d{2}-\d{2}' | head -1)
-                  echo "Data COT anterior: $OLD_DATE"
-                fi
-
-                if [ "$NEW_DATE" != "$OLD_DATE" ] || [ -z "$OLD_DATE" ]; then
-                  mv data/deafut_new.txt data/deafut.txt
-                  echo "$NEW_DATE" > data/last_update.txt
-                  date -u '+%Y-%m-%d %H:%M UTC' >> data/last_update.txt
-                  echo "NOVO" >> data/last_update.txt
-                  echo "COT_DATE=$NEW_DATE" >> $GITHUB_ENV
-                  echo "COT_STATUS=new" >> $GITHUB_ENV
-                  SUCCESS=true
-                  echo "✅ Dados NOVOS: $NEW_DATE"
-                  break
-                else
-                  rm data/deafut_new.txt
-                  echo "⏳ Mesma data ($NEW_DATE) — CFTC ainda nao publicou"
-                  echo "COT_STATUS=same" >> $GITHUB_ENV
-                  if [ "$ATTEMPT" -lt 3 ]; then
-                    echo "A esperar 5 minutos..."
-                    sleep 300
-                  fi
-                fi
+              if [ "$NEW_DATE" != "$OLD_DATE" ] || [ -z "$OLD_DATE" ]; then
+                mv data/deafut_new.txt data/deafut.txt
+                echo "$NEW_DATE" > data/last_update.txt
+                date -u '+%Y-%m-%d %H:%M UTC' >> data/last_update.txt
+                echo "NOVO" >> data/last_update.txt
+                echo "COT_DATE=$NEW_DATE" >> $GITHUB_ENV
+                echo "COT_STATUS=new" >> $GITHUB_ENV
+                SUCCESS=true
+                echo "Dados NOVOS: $NEW_DATE"
+                break
               else
-                echo "⚠️ Ficheiro com poucas linhas ($LINES)"
-                rm -f data/deafut_new.txt
+                rm data/deafut_new.txt
+                echo "Mesma data ($NEW_DATE) — CFTC ainda nao publicou"
+                echo "COT_STATUS=same" >> $GITHUB_ENV
+                if [ "$ATTEMPT" -lt 3 ]; then
+                  echo "A esperar 5 minutos..."
+                  sleep 300
+                fi
               fi
             else
-              echo "⚠️ HTTP $HTTP_CODE"
+              echo "Falhou (exit $WGET_EXIT, $SIZE bytes)"
               rm -f data/deafut_new.txt
               if [ "$ATTEMPT" -lt 3 ]; then
                 echo "A esperar 5 minutos..."
@@ -81,14 +83,15 @@ jobs:
           if [ "$SUCCESS" = "false" ]; then
             if [ -f data/deafut.txt ]; then
               OLD_DATE=$(head -1 data/deafut.txt | grep -oP '\d{4}-\d{2}-\d{2}' | head -1)
-              echo "⚠️ Sem dados novos. Manter versao anterior: $OLD_DATE"
+              echo "Sem dados novos. Manter versao anterior: $OLD_DATE"
               echo "COT_DATE=$OLD_DATE" >> $GITHUB_ENV
               echo "$OLD_DATE" > data/last_update.txt
               date -u '+%Y-%m-%d %H:%M UTC' >> data/last_update.txt
               echo "SEM_ALTERACAO (feriado/atraso CFTC)" >> data/last_update.txt
             else
-              echo "❌ Sem ficheiro COT"
+              echo "Sem ficheiro COT"
               echo "COT_STATUS=failed" >> $GITHUB_ENV
+              exit 1
             fi
           fi
 
